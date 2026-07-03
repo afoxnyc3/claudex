@@ -643,6 +643,29 @@ sed_escape() {
   printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/[&/]/\\&/g'
 }
 
+# implement_render_template <template-file> <KEY=VALUE>...
+# Prints the template with every {{KEY}} placeholder replaced by VALUE.
+# Pure-bash replacement, so values may contain any characters (including
+# newlines, slashes, ampersands) without sed-escaping hazards. Returns
+# non-zero when the template is missing or empty so callers can fall back
+# to their inline message (fail-open: a deleted template never breaks the
+# loop, it just degrades to the built-in wording).
+implement_render_template() {
+  local tpl="$1"
+  shift
+  [ -s "$tpl" ] || return 1
+  local content
+  content=$(cat "$tpl" 2>/dev/null)
+  [ -n "$content" ] || return 1
+  local pair key val
+  for pair in "$@"; do
+    key="${pair%%=*}"
+    val="${pair#*=}"
+    content="${content//"{{$key}}"/$val}"
+  done
+  printf '%s' "$content"
+}
+
 # True (0) when the working tree has changes that matter for the loop.
 # Excludes .claude/ because the hook's own state files live there untracked
 # and would otherwise make the tree read as permanently dirty. If git errors,
@@ -721,6 +744,22 @@ Write that file before exiting."
     prev_tally_line="**Previous round:** $(claudex_findings_severity_counts "$prev_file")
 
 "
+  fi
+
+  # T1.4: prefer the prompt template when present; fall back to the inline
+  # message below if it is missing or empty (fail-open).
+  local tpl_msg
+  if tpl_msg=$(implement_render_template \
+      "$CLAUDE_PLUGIN_ROOT/scripts/prompts/implement-mode-review.md" \
+      "TASK=$TASK" \
+      "ROUND=$round_num" \
+      "MAX_ROUNDS=$MAX_ROUNDS" \
+      "PERSONA_LABEL=$persona_label" \
+      "RUNNER_SCRIPT=$RUNNER" \
+      "FINDINGS_FILE=$findings_file" \
+      "REVIEW_ID=$REVIEW_ID" \
+      "PREV_TALLY_LINE=$prev_tally_line"); then
+    block "$tpl_msg"
   fi
 
   block "### Claudex implement review, round $round_num of $MAX_ROUNDS, $persona_label
@@ -856,6 +895,14 @@ then end your turn."
         # pre-existing dirty files cannot wedge the loop. "none" marks an
         # unborn branch (no commits yet).
         claudex_state_set_field "$ACTIVE_STATE" "commit_baseline" "$(git rev-parse HEAD 2>/dev/null || echo none)"
+        # T1.4: prefer the prompt template when present; fall back to the
+        # inline message below if it is missing or empty (fail-open).
+        if COMMIT_MSG=$(implement_render_template \
+            "$CLAUDE_PLUGIN_ROOT/scripts/prompts/implement-mode-commit.md" \
+            "TASK=$TASK" \
+            "BRANCH=${CURRENT_BRANCH:-the feature branch}"); then
+          block "$COMMIT_MSG"
+        fi
         block "### Claudex implement: task approved, commit it
 
 Codex had no material findings on:
