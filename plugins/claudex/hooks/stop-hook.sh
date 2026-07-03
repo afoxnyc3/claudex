@@ -636,8 +636,11 @@ implement_tasks_remaining_count() {
 
 # Escape a value for safe use in claudex_state_set_field, which feeds values
 # straight into a sed replacement. Escapes backslash, slash, and ampersand.
+# Backslash is escaped FIRST in its own pass: the bracket-class form [&/\]
+# silently fails to match backslash on BSD sed, so the passes must be separate
+# and ordered (backslash first, or later passes would double-escape it).
 sed_escape() {
-  printf '%s' "$1" | sed -e 's/[&/\]/\\&/g'
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/[&/]/\\&/g'
 }
 
 # True (0) when the working tree has changes that matter for the loop.
@@ -848,6 +851,11 @@ then end your turn."
           approve "CAS failed"
         fi
         claudex_state_set_field "$ACTIVE_STATE" "nudges" "0"
+        # Baseline for the committing phase: the commit is judged by HEAD
+        # advancing past this sha, NOT by whole-tree cleanliness, so unrelated
+        # pre-existing dirty files cannot wedge the loop. "none" marks an
+        # unborn branch (no commits yet).
+        claudex_state_set_field "$ACTIVE_STATE" "commit_baseline" "$(git rev-parse HEAD 2>/dev/null || echo none)"
         block "### Claudex implement: task approved, commit it
 
 Codex had no material findings on:
@@ -882,24 +890,31 @@ The user decides next: address the findings manually and commit, re-run with a h
       ;;
 
     committing)
-      if implement_tree_dirty; then
-        # Claude ended the turn without committing everything. Nudge once,
+      # Judge commit status against THIS task's baseline (HEAD sha recorded
+      # at review approval), not whole-tree cleanliness: unrelated dirty
+      # files in the working tree must not wedge the loop. If the baseline
+      # is missing (state from an older version) or git errors, fall open
+      # toward progress; the TASKS.md queue guard below still applies.
+      COMMIT_BASELINE=$(claudex_state_read_field "$ACTIVE_STATE" "commit_baseline")
+      HEAD_NOW=$(git rev-parse HEAD 2>/dev/null) || HEAD_NOW=""
+      if [ -n "$COMMIT_BASELINE" ] && [ "${HEAD_NOW:-none}" = "$COMMIT_BASELINE" ]; then
+        # No new commit since the review approved the task. Nudge once,
         # then fail open rather than trap.
         if [ "$NUDGES" -ge 1 ]; then
-          log "committing: tree still dirty after nudge; fail-open"
+          log "committing: no new commit after nudge; fail-open"
           approve "commit not confirmed"
         fi
         claudex_state_set_field "$ACTIVE_STATE" "nudges" "1"
         block "### Claudex implement: commit still pending
 
-The working tree still has uncommitted changes for:
+No commit has landed yet for:
 
 **Task:** $TASK
 
 Mark the task ✓ in TASKS.md, stage the specific files you changed (never \`git add -A\`), commit with a \`feat(T<num>): ...\` message, then end your turn."
       fi
 
-      # Tree is clean: the task landed. Advance the queue.
+      # A new commit landed since the review baseline. Advance the queue.
       NEXT_TASK=$(implement_next_task)
       REMAINING=$(implement_tasks_remaining_count)
 

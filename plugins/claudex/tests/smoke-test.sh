@@ -374,6 +374,16 @@ claudex_state_set_field "$ST30" "round" "2"
 ts_after_set=$(grep '^last_updated_at:' "$ST30" | sed 's/^last_updated_at: //')
 check "last_updated_at refreshed by set_field" test "$ts_initial" != "$ts_after_set"
 
+section "31. sed_escape handles backslash, ampersand, and slash"
+# Extract sed_escape from the hook and exercise it directly. The old
+# bracket-class form [&/\] silently failed to escape backslash on BSD sed.
+eval "$(sed -n '/^sed_escape()/,/^}/p' "$HOOK")"
+esc=$(sed_escape 'back\slash & for/ward')
+check "all three sed-special chars escaped" \
+  test "$esc" = 'back\\slash \& for\/ward'
+check "round-trips unchanged through a sed replacement" \
+  test "$(printf 'task: OLD\n' | sed "s/OLD/$esc/")" = 'task: back\slash & for/ward'
+
 # Cleanup
 cd - >/dev/null
 rm -rf "$TMP"
