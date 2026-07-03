@@ -411,6 +411,104 @@ check "round 1 label matches senior-engineer persona" bash -c "echo '$lbl1' | gr
 check "round 2 label matches security persona" bash -c "echo '$lbl2' | grep -qi 'security'"
 check "round 3 label matches ops persona" bash -c "echo '$lbl3' | grep -qiE 'ops|SRE'"
 
+section "33. Implement mode (T1.3): inline task writes well-formed state"
+bash "$ROLLBACK" >/dev/null 2>&1
+rm -f TASKS.md
+# Init instructions contain apostrophes, so grep a file instead of an
+# echo'd variable (a single quote inside bash -c '...' would break it).
+OUT33=$(mktemp)
+bash "$START" implement "add a health endpoint to the API" > "$OUT33" 2>&1
+check "implement mode initialized" grep -qi 'implement mode initialized' "$OUT33"
+check "output shows selected task" grep -q 'add a health endpoint' "$OUT33"
+check "output names the feature branch" grep -q 'claudex/implement-' "$OUT33"
+check "output instructs reading TASKS.md" grep -q 'TASKS.md' "$OUT33"
+check "output says do NOT commit" grep -qi 'do NOT commit' "$OUT33"
+ID33=$(ls .claude/claudex/*.state 2>/dev/null | head -1 | xargs -n1 basename | sed 's/.state$//')
+ST33=".claude/claudex/$ID33.state"
+check "state file created" test -f "$ST33"
+check "mode=implement" bash -c "grep -q '^mode: implement$' '$ST33'"
+check "phase=implementing" bash -c "grep -q '^phase: implementing$' '$ST33'"
+check "topic carries the task text" bash -c "grep '^topic:' '$ST33' | grep -q 'add a health endpoint'"
+check "task carries the task text" bash -c "grep '^task:' '$ST33' | grep -q 'add a health endpoint'"
+check "round=1" bash -c "grep -q '^round: 1$' '$ST33'"
+check "max_rounds=3 (implement default)" bash -c "grep -q '^max_rounds: 3$' '$ST33'"
+check "from_tasks=false" bash -c "grep -q '^from_tasks: false$' '$ST33'"
+check "review_id matches filename" bash -c "grep -q \"^review_id: $ID33\$\" '$ST33'"
+check "repo_root present" bash -c "grep -qE '^repo_root: .+' '$ST33'"
+check "session_id present" bash -c "grep -qE '^session_id: .+' '$ST33'"
+check "started_at present" bash -c "grep -qE '^started_at: [0-9]{4}-' '$ST33'"
+check "current_branch is claudex/implement-*" bash -c "grep -qE '^current_branch: claudex/implement-.+' '$ST33'"
+check "tasks_completed=0" bash -c "grep -q '^tasks_completed: 0$' '$ST33'"
+check "tasks_remaining numeric" bash -c "grep -qE '^tasks_remaining: [0-9]+$' '$ST33'"
+check "decision_signal=none" bash -c "grep -q '^decision_signal: none$' '$ST33'"
+
+bash "$ROLLBACK" >/dev/null 2>&1
+
+section "34. Implement mode (T1.3): --from-tasks pulls next unfinished task"
+cat > TASKS.md <<'TASKSEOF'
+# Tasks
+
+### T9.1 Already finished task ✓
+- Acceptance: done
+
+### T9.2 Wire up the widget frobnicator
+- Acceptance: frobnicator frobs
+
+### T9.3 Another pending task
+- Acceptance: pending
+TASKSEOF
+OUT34=$(mktemp)
+bash "$START" implement --from-tasks > "$OUT34" 2>&1
+check "--from-tasks initialized" grep -qi 'implement mode initialized' "$OUT34"
+check "--from-tasks skips ✓ task and picks T9.2" grep -q 'T9.2 Wire up the widget frobnicator' "$OUT34"
+check "output mentions --from-tasks source" grep -qi 'from-tasks' "$OUT34"
+ID34=$(ls .claude/claudex/*.state 2>/dev/null | head -1 | xargs -n1 basename | sed 's/.state$//')
+ST34=".claude/claudex/$ID34.state"
+check "mode=implement" bash -c "grep -q '^mode: implement$' '$ST34'"
+check "phase=implementing" bash -c "grep -q '^phase: implementing$' '$ST34'"
+check "task=T9.2 heading" bash -c "grep '^task:' '$ST34' | grep -q 'T9.2 Wire up the widget frobnicator'"
+check "from_tasks=true" bash -c "grep -q '^from_tasks: true$' '$ST34'"
+check "round=1" bash -c "grep -q '^round: 1$' '$ST34'"
+check "tasks_remaining=2 (T9.2 and T9.3)" bash -c "grep -q '^tasks_remaining: 2$' '$ST34'"
+check "tasks_completed=0" bash -c "grep -q '^tasks_completed: 0$' '$ST34'"
+check "decision_signal=none" bash -c "grep -q '^decision_signal: none$' '$ST34'"
+check "current_branch is claudex/implement-*" bash -c "grep -qE '^current_branch: claudex/implement-.+' '$ST34'"
+
+bash "$ROLLBACK" >/dev/null 2>&1
+
+section "35. Implement mode (T1.3): flag validation and guards"
+output=$(bash "$START" implement --rounds 5 "custom rounds task" 2>&1)
+ID35=$(ls .claude/claudex/*.state 2>/dev/null | head -1 | xargs -n1 basename | sed 's/.state$//')
+check "--rounds 5 overrides implement default" bash -c "grep -q '^max_rounds: 5$' '.claude/claudex/$ID35.state'"
+bash "$ROLLBACK" >/dev/null 2>&1
+
+output=$(bash "$START" implement --from-tasks "inline task too" 2>&1)
+check "--from-tasks plus inline task rejected" bash -c "echo '$output' | grep -qi 'not both'"
+check "no state file on both-args error" bash -c "[ -z \"\$(ls .claude/claudex/*.state 2>/dev/null)\" ]"
+
+output=$(bash "$START" implement 2>&1)
+check "implement with no task rejected" bash -c "echo '$output' | grep -qi 'task description or --from-tasks'"
+
+rm -f TASKS.md
+output=$(bash "$START" implement --from-tasks 2>&1)
+check "--from-tasks without TASKS.md rejected" bash -c "echo '$output' | grep -qi 'TASKS.md to exist'"
+
+cat > TASKS.md <<'TASKSEOF'
+### T9.1 All done here ✓
+TASKSEOF
+OUT35=$(mktemp)
+bash "$START" implement --from-tasks > "$OUT35" 2>&1
+check "--from-tasks with all tasks ✓ rejected" grep -qi 'No unfinished tasks' "$OUT35"
+rm -f TASKS.md
+
+output=$(bash "$START" plan --from-tasks "plan topic" 2>&1)
+check "--from-tasks on plan mode rejected" bash -c "echo '$output' | grep -qi 'only applies to implement mode'"
+
+output=$(bash "$START" implement --from-draft "draft on implement" 2>&1)
+check "--from-draft on implement mode rejected" bash -c "echo '$output' | grep -qi 'only applies to plan mode'"
+
+bash "$ROLLBACK" >/dev/null 2>&1
+
 # Cleanup
 cd - >/dev/null
 rm -rf "$TMP"
@@ -426,5 +524,5 @@ if [ $fail -gt 0 ]; then
   done
   exit 1
 fi
-printf '\n  Smoke test passed. Plan mode and review mode lifecycles work.\n'
+printf '\n  Smoke test passed. Plan, review, and implement-init lifecycles work.\n'
 exit 0
