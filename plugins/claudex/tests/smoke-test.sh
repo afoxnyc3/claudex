@@ -384,6 +384,33 @@ check "all three sed-special chars escaped" \
 check "round-trips unchanged through a sed replacement" \
   test "$(printf 'task: OLD\n' | sed "s/OLD/$esc/")" = 'task: back\slash & for/ward'
 
+section "32. Implement-mode personas (T1.2): non-empty, distinct, code-specific"
+source "$PLUGIN_ROOT/scripts/personas.sh"
+imp1=$(claudex_implement_persona_for_round 1)
+imp2=$(claudex_implement_persona_for_round 2)
+imp3=$(claudex_implement_persona_for_round 3)
+check "implement persona round 1 non-empty" test -n "$imp1"
+check "implement persona round 2 non-empty" test -n "$imp2"
+check "implement persona round 3 non-empty" test -n "$imp3"
+check "implement personas 1 and 2 distinct" test "$imp1" != "$imp2"
+check "implement personas 2 and 3 distinct" test "$imp2" != "$imp3"
+check "implement personas 1 and 3 distinct" test "$imp1" != "$imp3"
+check "round 4+ reuses ops persona" test "$(claudex_implement_persona_for_round 4)" = "$imp3"
+plan1=$(claudex_persona_for_round 1)
+plan2=$(claudex_persona_for_round 2)
+plan3=$(claudex_persona_for_round 3)
+check "implement round 1 differs from plan round 1" test "$imp1" != "$plan1"
+check "implement round 2 differs from plan round 2" test "$imp2" != "$plan2"
+check "implement round 3 differs from plan round 3" test "$imp3" != "$plan3"
+lbl1=$(claudex_implement_persona_label_for_round 1)
+lbl2=$(claudex_implement_persona_label_for_round 2)
+lbl3=$(claudex_implement_persona_label_for_round 3)
+check "implement labels non-empty" bash -c "test -n '$lbl1' && test -n '$lbl2' && test -n '$lbl3'"
+check "implement labels distinct" bash -c "test '$lbl1' != '$lbl2' && test '$lbl2' != '$lbl3' && test '$lbl1' != '$lbl3'"
+check "round 1 label matches senior-engineer persona" bash -c "echo '$lbl1' | grep -qi 'senior'"
+check "round 2 label matches security persona" bash -c "echo '$lbl2' | grep -qi 'security'"
+check "round 3 label matches ops persona" bash -c "echo '$lbl3' | grep -qiE 'ops|SRE'"
+
 # Cleanup
 cd - >/dev/null
 rm -rf "$TMP"
