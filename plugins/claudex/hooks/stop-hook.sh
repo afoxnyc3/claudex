@@ -6,8 +6,10 @@
 # the next step.
 #
 # Modes:
-#   plan   - draft PLAN.md, adversarial-review it, revise, repeat
-#   review - run code review, write findings + proposed-fixes (read-only v1)
+#   plan      - draft PLAN.md, adversarial-review it, revise, repeat
+#   review    - run code review, write findings + proposed-fixes (read-only v1)
+#   implement - implement tasks from TASKS.md, Codex-review each diff, commit
+#               per task, advance the queue until empty or max rounds
 #
 # Safety: every error path returns {"decision":"approve"} so the user can
 # never be trapped. ERR trap installed at the top.
@@ -101,7 +103,13 @@ case "$ROUND" in
   ''|*[!0-9]*) ROUND=1 ;;
 esac
 case "$MAX_ROUNDS" in
-  ''|*[!0-9]*) MAX_ROUNDS=5 ;;
+  ''|*[!0-9]*)
+    if [ "$MODE" = "implement" ]; then
+      MAX_ROUNDS=3
+    else
+      MAX_ROUNDS=5
+    fi
+    ;;
 esac
 
 RUNNER="$STATE_DIR/$REVIEW_ID-runner.sh"
@@ -156,13 +164,18 @@ write_runner_script() {
   local focus="$2"
   local round_num="$3"
 
-  # Plan mode rotates personas per round. Review mode is single-shot, so we
-  # use only the round-1 senior-engineer stanza to keep the prompt stable.
+  # Plan mode rotates personas per round. Implement mode rotates through its
+  # own code-review personas (falling back to plan personas until T1.2 lands).
+  # Review mode is single-shot, so it uses only the round-1 senior-engineer
+  # stanza to keep the prompt stable.
   local persona=""
   local persona_label=""
   if [ "$mode" = "plan" ]; then
     persona=$(claudex_persona_for_round "$round_num")
     persona_label=$(claudex_persona_label_for_round "$round_num")
+  elif [ "$mode" = "implement" ]; then
+    persona=$(implement_persona_for_round "$round_num")
+    persona_label=$(implement_persona_label_for_round "$round_num")
   else
     persona=$(claudex_persona_for_round 1)
     persona_label=$(claudex_persona_label_for_round 1)
@@ -548,6 +561,405 @@ After Codex finishes, end your turn. The hook will allow exit."
     *)
       log "Unknown review phase: $PHASE"
       approve "unknown review phase"
+      ;;
+  esac
+fi
+
+# === IMPLEMENT MODE LIFECYCLE ===
+#
+# Phases: implementing -> reviewing -> committing -> (implementing | done),
+# plus cancelled. Claude implements one task from TASKS.md, Codex reviews the
+# working-tree diff each round, Claude commits only after an LGTM signal, and
+# the hook advances the queue until TASKS.md is empty or max rounds is hit.
+#
+# Contracts this branch depends on (implemented in later tasks; guarded here):
+#
+#   personas.sh (T1.2):
+#     claudex_implement_persona_for_round <round>
+#       -> prints a code-review persona stanza (1: senior engineer / logic,
+#          2: security, 3+: ops/SRE)
+#     claudex_implement_persona_label_for_round <round>
+#       -> prints a one-line label for BLOCK headers
+#     Until T1.2 lands, the wrappers below fall back to the plan-mode personas.
+#
+#   mark-done.sh (T1.5):
+#     bash mark-done.sh <review_id> --task-complete
+#       -> sets decision_signal: no-material-findings
+#          (current task LGTM'd; hook walks Claude through the commit, then
+#           advances the queue)
+#     bash mark-done.sh <review_id> --loop-complete
+#       -> sets decision_signal: loop-complete
+#          (terminate the whole loop; hook delivers a final summary and exits)
+#     Until T1.5 lands, mark-done.sh ignores extra args and always sets
+#     no-material-findings. Degradation: --task-complete behaves correctly
+#     today; --loop-complete advances the queue instead of terminating, but
+#     the loop still ends when TASKS.md has no unfinished tasks. Nobody is
+#     ever trapped either way.
+
+# Persona wrappers: prefer the implement-specific personas when personas.sh
+# provides them (T1.2), otherwise fall back to the plan-mode rotation.
+implement_persona_for_round() {
+  if declare -F claudex_implement_persona_for_round >/dev/null 2>&1; then
+    claudex_implement_persona_for_round "$1"
+  else
+    claudex_persona_for_round "$1"
+  fi
+}
+
+implement_persona_label_for_round() {
+  if declare -F claudex_implement_persona_label_for_round >/dev/null 2>&1; then
+    claudex_implement_persona_label_for_round "$1"
+  else
+    claudex_persona_label_for_round "$1"
+  fi
+}
+
+# Next unfinished task heading in TASKS.md ("### T1.2 Title" -> "T1.2 Title").
+# A task counts as finished when its heading line contains the completion
+# marker "✓" (the convention used by ClaudeClaw-scaffolded projects).
+implement_next_task() {
+  [ -f "TASKS.md" ] || return 1
+  grep -E '^###[[:space:]]+T[0-9]' TASKS.md 2>/dev/null \
+    | grep -v '✓' | head -1 | sed -E 's/^###[[:space:]]+//'
+}
+
+implement_tasks_remaining_count() {
+  if [ ! -f "TASKS.md" ]; then
+    echo 0
+    return 0
+  fi
+  local n
+  n=$(grep -E '^###[[:space:]]+T[0-9]' TASKS.md 2>/dev/null | grep -cv '✓' 2>/dev/null)
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  echo "$n"
+}
+
+# Escape a value for safe use in claudex_state_set_field, which feeds values
+# straight into a sed replacement. Escapes backslash, slash, and ampersand.
+sed_escape() {
+  printf '%s' "$1" | sed -e 's/[&/\]/\\&/g'
+}
+
+# True (0) when the working tree has changes that matter for the loop.
+# Excludes .claude/ because the hook's own state files live there untracked
+# and would otherwise make the tree read as permanently dirty. If git errors,
+# this reads as clean, which downstream paths treat in the fail-open
+# direction (nudge once, then approve).
+implement_tree_dirty() {
+  [ -n "$(git status --porcelain -- . ':(exclude).claude' 2>/dev/null)" ]
+}
+
+# implement_start_review_round <round>
+# Writes the Codex runner for the given round and BLOCKs with instructions.
+# Never returns (block exits 0).
+implement_start_review_round() {
+  local round_num="$1"
+  local findings_file="$REVIEW_DIR/findings-task${TASK_SEQ}-round-${round_num}.md"
+  local prev_file="$REVIEW_DIR/findings-task${TASK_SEQ}-round-$((round_num - 1)).md"
+
+  local prev_ref=""
+  if [ "$round_num" -gt 1 ] && [ -f "$prev_file" ]; then
+    prev_ref="
+
+The previous round's findings are at $prev_file. The code should already address them; flag any that were dismissed without good reason. Focus fresh attention on what is still wrong and on anything the fixes introduced."
+  fi
+
+  local focus="You are doing an adversarial code review of the working-tree changes for an implementation task.
+
+Task: $TASK
+
+Round: $round_num of $MAX_ROUNDS$prev_ref
+
+Run \`git diff HEAD\` to see the changes. Then run \`git status --porcelain\` and read the full contents of any untracked files it lists; new files are part of this change too.
+
+Hunt for real defects: logic bugs, unhandled edge cases, missing error handling, security issues (injection, validation gaps, secrets in code), race conditions, silent failures, and deviations from SPEC.md or the task's acceptance criteria in TASKS.md if those files exist.
+
+For each material finding:
+- Severity: high, medium, or low
+- File path and line numbers if known
+- One-sentence description of what could go wrong
+- Specific recommendation
+
+Skip style nits. If you find no material concerns, say exactly: 'No substantive findings.'
+
+CRITICAL OUTPUT REQUIREMENT: After your full analysis, write a clean summary of just the findings (severity + one-line description + recommendation) to the file:
+
+  $findings_file
+
+Use this exact format:
+
+# Round $round_num findings
+
+## High
+- <one-line description> (<recommendation>)
+- ...
+
+## Medium
+- ...
+
+## Low
+- ...
+
+If no material findings, the file should contain exactly:
+
+# Round $round_num findings
+
+No substantive findings.
+
+Write that file before exiting."
+
+  write_runner_script "implement" "$focus" "$round_num"
+
+  local persona_label
+  persona_label=$(implement_persona_label_for_round "$round_num")
+
+  local prev_tally_line=""
+  if [ -f "$prev_file" ]; then
+    prev_tally_line="**Previous round:** $(claudex_findings_severity_counts "$prev_file")
+
+"
+  fi
+
+  block "### Claudex implement review, round $round_num of $MAX_ROUNDS, $persona_label
+
+**Task:** $TASK
+
+${prev_tally_line}**Run the runner:**
+
+\`\`\`
+bash $RUNNER
+\`\`\`
+
+When Codex finishes, read the findings summary from:
+
+\`$findings_file\`
+
+**Then decide:**
+
+- **Material findings exist** → fix them in the code. Do NOT commit. Then end your turn; the next review round starts automatically.
+- **No material findings (or only style nits)** → signal task completion:
+  \`\`\`
+  bash \${CLAUDE_PLUGIN_ROOT}/scripts/mark-done.sh $REVIEW_ID --task-complete
+  \`\`\`
+  Then end your turn. The hook will walk you through the commit.
+- **To stop the entire loop instead** (wrong task, blocked, user asked to stop):
+  \`\`\`
+  bash \${CLAUDE_PLUGIN_ROOT}/scripts/mark-done.sh $REVIEW_ID --loop-complete
+  \`\`\`
+  Then end your turn.
+
+**Hard stop:** if this is round $MAX_ROUNDS and Codex still has substantive findings, end your turn anyway. The hook will exit cleanly with the remaining concerns."
+}
+
+# implement_finish_loop <headline> <detail>
+# Marks the loop done and BLOCKs once with the final summary so the user
+# actually sees it. The next hook fire hits phase=done and approves + cleans
+# up. Never returns.
+implement_finish_loop() {
+  local headline="$1"
+  local detail="$2"
+  claudex_state_set_field "$ACTIVE_STATE" "phase" "done" || approve "state write failed at finish"
+  local elapsed
+  elapsed=$(format_elapsed "$STARTED_AT_EPOCH")
+  [ -z "$elapsed" ] && elapsed="unknown"
+  local remaining
+  remaining=$(implement_tasks_remaining_count)
+  log "Implement loop $REVIEW_ID finished: $headline (completed=$TASKS_COMPLETED remaining=$remaining elapsed=$elapsed)"
+  block "### Claudex implement loop $headline
+
+**Branch:** ${CURRENT_BRANCH:-unknown}
+**Tasks completed this loop:** $TASKS_COMPLETED
+**Tasks still unfinished in TASKS.md:** $remaining
+**Total time:** $elapsed
+
+$detail
+
+**Print this summary to the user so they see the loop landed.** Then end your turn. The Stop hook will allow exit cleanly."
+}
+
+if [ "$MODE" = "implement" ]; then
+  TASK=$(claudex_state_read_field "$ACTIVE_STATE" "task" | sed -e 's/^"//' -e 's/"$//')
+  [ -n "$TASK" ] || TASK="$TOPIC"
+  TASKS_COMPLETED=$(claudex_state_read_field "$ACTIVE_STATE" "tasks_completed")
+  case "$TASKS_COMPLETED" in ''|*[!0-9]*) TASKS_COMPLETED=0 ;; esac
+  TASK_SEQ=$((TASKS_COMPLETED + 1))
+  CURRENT_BRANCH=$(claudex_state_read_field "$ACTIVE_STATE" "current_branch")
+  [ -n "$CURRENT_BRANCH" ] || CURRENT_BRANCH=$(git branch --show-current 2>/dev/null)
+  NUDGES=$(claudex_state_read_field "$ACTIVE_STATE" "nudges")
+  case "$NUDGES" in ''|*[!0-9]*) NUDGES=0 ;; esac
+
+  # Everything below leans on git. If we cannot even ask git, fail open.
+  if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    log "implement mode outside a git repo; fail-open"
+    approve "not a git repo"
+  fi
+
+  # A loop-complete signal terminates the loop from any active phase.
+  if [ "$DECISION_SIGNAL" = "loop-complete" ]; then
+    case "$PHASE" in
+      done|cancelled) ;;
+      *)
+        implement_finish_loop "stopped by request" \
+          "The loop was terminated early via --loop-complete. Any uncommitted changes are left in the working tree on branch ${CURRENT_BRANCH:-unknown}."
+        ;;
+    esac
+  fi
+
+  case "$PHASE" in
+    implementing)
+      # Claude just finished an implementation turn. There must be changes
+      # to review; otherwise nudge once, then fail open.
+      if ! implement_tree_dirty; then
+        if [ "$NUDGES" -ge 1 ]; then
+          log "implementing: no changes after nudge; fail-open"
+          approve "no changes to review"
+        fi
+        claudex_state_set_field "$ACTIVE_STATE" "nudges" "1"
+        block "### Claudex implement mode: no changes detected
+
+You ended your turn but the working tree has no changes to review.
+
+**Task:** $TASK
+
+Implement the task (per SPEC.md and its acceptance criteria in TASKS.md), then end your turn. Do NOT commit; the hook runs a Codex review first.
+
+If you are genuinely blocked and need to stop the loop, run:
+
+\`\`\`
+bash \${CLAUDE_PLUGIN_ROOT}/scripts/mark-done.sh $REVIEW_ID --loop-complete
+\`\`\`
+
+then end your turn."
+      fi
+
+      if ! claudex_phase_transition "$ACTIVE_STATE" "implementing" "reviewing"; then
+        log "CAS implementing->reviewing failed"
+        approve "CAS failed"
+      fi
+      claudex_state_set_field "$ACTIVE_STATE" "nudges" "0"
+      implement_start_review_round "$ROUND"
+      ;;
+
+    reviewing)
+      if [ "$DECISION_SIGNAL" = "no-material-findings" ]; then
+        # Codex LGTM'd the current task. Walk Claude through the commit.
+        if ! claudex_phase_transition "$ACTIVE_STATE" "reviewing" "committing"; then
+          log "CAS reviewing->committing failed"
+          approve "CAS failed"
+        fi
+        claudex_state_set_field "$ACTIVE_STATE" "nudges" "0"
+        block "### Claudex implement: task approved, commit it
+
+Codex had no material findings on:
+
+**Task:** $TASK
+
+Now land it:
+
+1. Mark the task complete in TASKS.md: append ✓ to its \`###\` heading (e.g. \`### $TASK ✓\`).
+2. Stage the specific files you changed (never \`git add -A\` or \`git add .\`), including TASKS.md.
+3. Commit to the current branch (${CURRENT_BRANCH:-the feature branch}) with a message like \`feat(T<num>): <imperative summary>\`, a short body, and a \`Closes T<num>\` footer.
+4. End your turn. The hook picks the next task from TASKS.md automatically.
+
+Do NOT push. Local commit only."
+      fi
+
+      # No task-complete signal: Claude revised after findings. Next round,
+      # unless the round budget is exhausted.
+      NEW_ROUND=$((ROUND + 1))
+      if [ "$NEW_ROUND" -gt "$MAX_ROUNDS" ]; then
+        claudex_state_set_field "$ACTIVE_STATE" "decision_signal" "max-reached"
+        LAST_FINDINGS="$REVIEW_DIR/findings-task${TASK_SEQ}-round-${ROUND}.md"
+        implement_finish_loop "stopped at max rounds (round $ROUND of $MAX_ROUNDS)" \
+          "The final review round still had material findings for task '$TASK'. Its changes are left UNCOMMITTED in the working tree on branch ${CURRENT_BRANCH:-unknown}.
+
+Remaining concerns: \`$LAST_FINDINGS\`
+
+The user decides next: address the findings manually and commit, re-run with a higher round budget (\`/claudex:implement --rounds N ...\`), or discard the changes."
+      fi
+      claudex_state_set_field "$ACTIVE_STATE" "round" "$NEW_ROUND" || approve "state write failed"
+      implement_start_review_round "$NEW_ROUND"
+      ;;
+
+    committing)
+      if implement_tree_dirty; then
+        # Claude ended the turn without committing everything. Nudge once,
+        # then fail open rather than trap.
+        if [ "$NUDGES" -ge 1 ]; then
+          log "committing: tree still dirty after nudge; fail-open"
+          approve "commit not confirmed"
+        fi
+        claudex_state_set_field "$ACTIVE_STATE" "nudges" "1"
+        block "### Claudex implement: commit still pending
+
+The working tree still has uncommitted changes for:
+
+**Task:** $TASK
+
+Mark the task ✓ in TASKS.md, stage the specific files you changed (never \`git add -A\`), commit with a \`feat(T<num>): ...\` message, then end your turn."
+      fi
+
+      # Tree is clean: the task landed. Advance the queue.
+      NEXT_TASK=$(implement_next_task)
+      REMAINING=$(implement_tasks_remaining_count)
+
+      if [ -n "$NEXT_TASK" ] && [ "$NEXT_TASK" = "$TASK" ]; then
+        # TASKS.md was not updated; the queue would re-serve the same task.
+        if [ "$NUDGES" -ge 1 ]; then
+          log "committing: TASKS.md not updated after nudge; fail-open"
+          approve "task queue not advanced"
+        fi
+        claudex_state_set_field "$ACTIVE_STATE" "nudges" "1"
+        block "### Claudex implement: TASKS.md not updated
+
+The commit landed but TASKS.md still lists this task as unfinished:
+
+**Task:** $TASK
+
+Append ✓ to its \`###\` heading in TASKS.md, commit that change (\`chore: mark task complete\`), then end your turn."
+      fi
+
+      NEW_COMPLETED=$((TASKS_COMPLETED + 1))
+      claudex_state_set_field "$ACTIVE_STATE" "tasks_completed" "$NEW_COMPLETED" || approve "state write failed"
+      claudex_state_set_field "$ACTIVE_STATE" "tasks_remaining" "$REMAINING"
+      claudex_state_set_field "$ACTIVE_STATE" "nudges" "0"
+      TASKS_COMPLETED="$NEW_COMPLETED"
+      TASK_SEQ=$((TASKS_COMPLETED + 1))
+
+      if [ -z "$NEXT_TASK" ]; then
+        implement_finish_loop "complete ✓" \
+          "All tasks in TASKS.md are finished and committed on branch ${CURRENT_BRANCH:-unknown}. Nothing was pushed; the branch is local."
+      fi
+
+      claudex_state_set_field "$ACTIVE_STATE" "task" "$(sed_escape "$NEXT_TASK")" || approve "state write failed"
+      claudex_state_set_field "$ACTIVE_STATE" "round" "1"
+      claudex_state_set_field "$ACTIVE_STATE" "decision_signal" "none"
+      if ! claudex_phase_transition "$ACTIVE_STATE" "committing" "implementing"; then
+        log "CAS committing->implementing failed"
+        approve "CAS failed"
+      fi
+      block "### Claudex implement: next task
+
+Task committed. $REMAINING task(s) remaining in TASKS.md.
+
+**Next task:** $NEXT_TASK
+
+Read its acceptance criteria in TASKS.md (and SPEC.md if present), implement it on branch ${CURRENT_BRANCH:-the feature branch}, then end your turn. Do NOT commit; the hook runs a Codex review first."
+      ;;
+
+    done)
+      rm -f "$RUNNER" "$STATE_DIR/$REVIEW_ID-prompt.txt" "$STATE_DIR/$REVIEW_ID.lock" 2>/dev/null
+      approve "implement loop done"
+      ;;
+
+    cancelled)
+      rm -f "$RUNNER" "$STATE_DIR/$REVIEW_ID-prompt.txt" "$STATE_DIR/$REVIEW_ID.lock" 2>/dev/null
+      approve "implement loop cancelled"
+      ;;
+
+    *)
+      log "Unknown implement phase: $PHASE"
+      approve "unknown implement phase, fail-open"
       ;;
   esac
 fi
