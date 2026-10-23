@@ -509,6 +509,54 @@ check "--from-draft on implement mode rejected" bash -c "echo '$output' | grep -
 
 bash "$ROLLBACK" >/dev/null 2>&1
 
+section "36. Implement prompt templates (T1.4): exist, wired, and resolve"
+PROMPTS="$PLUGIN_ROOT/scripts/prompts"
+check "implement-mode-init.md exists and non-empty" test -s "$PROMPTS/implement-mode-init.md"
+check "implement-mode-review.md exists and non-empty" test -s "$PROMPTS/implement-mode-review.md"
+check "implement-mode-commit.md exists and non-empty" test -s "$PROMPTS/implement-mode-commit.md"
+# Static wiring: init is read by start-loop, review + commit by the stop hook.
+check "start-loop references init template" grep -q 'prompts/implement-mode-init.md' "$START"
+check "stop-hook references review template" grep -q 'prompts/implement-mode-review.md' "$HOOK"
+check "stop-hook references commit template" grep -q 'prompts/implement-mode-commit.md' "$HOOK"
+
+# Dynamic resolution: run the implement lifecycle and confirm each phase's
+# message comes out with placeholders substituted (no literal {{...}} left).
+OUT36=$(mktemp)
+bash "$START" implement "resolve templates end to end" > "$OUT36" 2>&1
+ID36=$(ls .claude/claudex/*.state 2>/dev/null | head -1 | xargs -n1 basename | sed 's/.state$//')
+check "init: template rendered (no unresolved placeholders)" bash -c "! grep -q '{{' '$OUT36'"
+check "init: task substituted" grep -q 'resolve templates end to end' "$OUT36"
+check "init: branch substituted" grep -q 'git checkout -b claudex/implement-' "$OUT36"
+check "init: loop id substituted" grep -q "$ID36" "$OUT36"
+
+# implementing -> reviewing: dirty tree, fire hook, expect the review template.
+echo "scratch" > scratch-t36.txt
+HOOK36=$(mktemp)
+echo '{}' | bash "$HOOK" 2>/dev/null > "$HOOK36"
+check "review: hook returns block" grep -q block "$HOOK36"
+check "review: template rendered (no unresolved placeholders)" bash -c "! grep -q '{{' '$HOOK36'"
+check "review: header present" grep -q 'Claudex implement review' "$HOOK36"
+check "review: task substituted" grep -q 'resolve templates end to end' "$HOOK36"
+check "review: round substituted" grep -q 'round 1 of 3' "$HOOK36"
+check "review: persona label substituted" bash -c "grep -qi 'senior' '$HOOK36'"
+check "review: findings file substituted" grep -q 'findings-task1-round-1.md' "$HOOK36"
+check "review: runner path substituted" grep -q "$ID36-runner.sh" "$HOOK36"
+
+# reviewing + LGTM signal -> committing: expect the commit template.
+bash "$MARK_DONE" "$ID36" >/dev/null 2>&1
+echo '{}' | bash "$HOOK" 2>/dev/null > "$HOOK36"
+check "commit: hook returns block" grep -q block "$HOOK36"
+check "commit: template rendered (no unresolved placeholders)" bash -c "! grep -q '{{' '$HOOK36'"
+check "commit: header present" grep -q 'task approved, commit it' "$HOOK36"
+check "commit: task substituted" grep -q 'resolve templates end to end' "$HOOK36"
+check "commit: branch substituted" grep -q 'claudex/implement-' "$HOOK36"
+check "commit: no git add -A allowed" grep -q 'never .git add -A' "$HOOK36"
+phase36=$(grep '^phase:' ".claude/claudex/$ID36.state" | sed 's/^phase: //')
+check "commit: phase transitioned to committing" test "$phase36" = "committing"
+rm -f scratch-t36.txt
+
+bash "$ROLLBACK" >/dev/null 2>&1
+
 # Cleanup
 cd - >/dev/null
 rm -rf "$TMP"
@@ -524,5 +572,5 @@ if [ $fail -gt 0 ]; then
   done
   exit 1
 fi
-printf '\n  Smoke test passed. Plan, review, and implement-init lifecycles work.\n'
+printf '\n  Smoke test passed. Plan, review, and implement lifecycles (incl. prompt templates) work.\n'
 exit 0
